@@ -1,0 +1,7 @@
+MNIST/
+__pycache__/
+.vscode
+.codex
+*.json
+*.npz
+*.txt
