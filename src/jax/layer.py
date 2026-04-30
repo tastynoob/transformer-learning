@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 
-dataType = jnp.float32
+dataType = jnp.float16
 tied_embedding_std = 0.02
 
 
@@ -166,15 +166,20 @@ def encoderLayer_init(key, d_model, d_ff, d_k, d_v, n_heads):
     return attn, norm1, ffn, norm2
 
 def encoderLayer_apply(x, mask, params, n_heads, drop_prob=0.1, key=None):
-    attn, norm1, ffn, norm2 = params
+    if len(params) == 4:
+        attn, norm1, ffn, norm2 = params
+        attn_res_scale = 1.0
+        ffn_res_scale = 1.0
+    else:
+        attn, norm1, ffn, norm2, attn_res_scale, ffn_res_scale = params
 
     x_norm = normalize_apply(x, norm1)
     a = multiHeadAttention_apply(x_norm, x_norm, x_norm, mask, attn, n_heads)
-    a = x + a
+    a = x + attn_res_scale * a
 
     a_norm = normalize_apply(a, norm2)
     b = feedforward_apply(a_norm, ffn, drop_prob, key)
-    b = a + b
+    b = a + ffn_res_scale * b
     return b
 
 def decoderLayer_init(key, d_model, d_ff, d_k, d_v, n_heads):
@@ -188,19 +193,25 @@ def decoderLayer_init(key, d_model, d_ff, d_k, d_v, n_heads):
     return self_attn, norm1, cross_attn, norm2, ffn, norm3
 
 def decoderLayer_apply(x, enc_output, lookahead_mask, enc_padding_mask, params, n_heads, drop_prob=0.1, key=None):
-    self_attn, norm1, cross_attn, norm2, ffn, norm3 = params
+    if len(params) == 6:
+        self_attn, norm1, cross_attn, norm2, ffn, norm3 = params
+        self_attn_res_scale = 1.0
+        cross_attn_res_scale = 1.0
+        ffn_res_scale = 1.0
+    else:
+        self_attn, norm1, cross_attn, norm2, ffn, norm3, self_attn_res_scale, cross_attn_res_scale, ffn_res_scale = params
 
     x_norm = normalize_apply(x, norm1)
     a = multiHeadAttention_apply(x_norm, x_norm, x_norm, lookahead_mask, self_attn, n_heads)
-    a = x + a
+    a = x + self_attn_res_scale * a
 
     a_norm = normalize_apply(a, norm2)
     b = multiHeadAttention_apply(a_norm, enc_output, enc_output, enc_padding_mask, cross_attn, n_heads)
-    b = a + b
+    b = a + cross_attn_res_scale * b
 
     b_norm = normalize_apply(b, norm3)
     c = feedforward_apply(b_norm, ffn, drop_prob, key)
-    c = b + c
+    c = b + ffn_res_scale * c
     return c
 
 def embedding_init(key, vocab_size, d_model):
@@ -260,7 +271,7 @@ def adaptiveOpt_init(model, lr=0.01, eps=1e-8):
     }
     return params, configs
 
-def adaptiveOpt_update(grads, opt_state, configs):
+def adaptiveOpt_update(grads, opt_state, configs, params=None):
     """自适应梯度下降优化器的更新"""
     acc = opt_state
     lr = configs['lr']
@@ -282,9 +293,9 @@ def adamOpt_init(model, lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8):
     """Adam 优化器的初始化"""
     if model is not None:
         m = jax.tree_util.tree_map(
-            lambda x: jnp.zeros_like(x, dtype=dataType), model)
+            lambda x: jnp.zeros_like(x, dtype=jnp.float32), model)
         v = jax.tree_util.tree_map(
-            lambda x: jnp.zeros_like(x, dtype=dataType), model)
+            lambda x: jnp.zeros_like(x, dtype=jnp.float32), model)
     else:
         m, v = None, None
 
@@ -306,10 +317,10 @@ def adamOpt_init(model, lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8):
     }
     return params, configs
 
-def adamOpt_update(grads, opt_state, configs):
+def adamOpt_update(grads, opt_state, configs, params=None):
     """Adam 优化器的更新"""
-    m = opt_state['m']
-    v = opt_state['v']
+    m = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), opt_state['m'])
+    v = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), opt_state['v'])
     t = opt_state['t'] + 1
 
     beta1 = configs['beta1']
@@ -318,12 +329,12 @@ def adamOpt_update(grads, opt_state, configs):
     eps = configs['eps']
 
     m = jax.tree_util.tree_map(
-        lambda m, g: beta1 * m + (1 - beta1) * g,
+        lambda m, g: beta1 * m + (1 - beta1) * g.astype(jnp.float32),
         m,
         grads
     )
     v = jax.tree_util.tree_map(
-        lambda v, g: beta2 * v + (1 - beta2) * jnp.square(g),
+        lambda v, g: beta2 * v + (1 - beta2) * jnp.square(g.astype(jnp.float32)),
         v,
         grads
     )
@@ -348,6 +359,114 @@ def adamOpt_update(grads, opt_state, configs):
     return updates, new_opt_state
 
 
+def adamWOpt_init(
+    model,
+    lr=0.001,
+    beta1=0.9,
+    beta2=0.95,
+    eps=1e-8,
+    weight_decay=0.01,
+    warmup_steps=0,
+    decay_steps=0,
+    min_lr_ratio=0.1,
+):
+    """AdamW optimizer with fp32 moments and optional warmup/cosine decay."""
+    if model is not None:
+        m = jax.tree_util.tree_map(lambda x: jnp.zeros_like(x, dtype=jnp.float32), model)
+        v = jax.tree_util.tree_map(lambda x: jnp.zeros_like(x, dtype=jnp.float32), model)
+    else:
+        m, v = None, None
+
+    params = {
+        'opt_state': {
+            'm': m,
+            'v': v,
+            't': 0,
+        }
+    }
+    configs = {
+        'lr': lr,
+        'beta1': beta1,
+        'beta2': beta2,
+        'eps': eps,
+        'weight_decay': weight_decay,
+        'lr_warmup_steps': warmup_steps,
+        'lr_decay_steps': decay_steps,
+        'min_lr_ratio': min_lr_ratio,
+        'opt_fn': adamWOpt_update,
+    }
+    return params, configs
+
+
+def _scheduled_lr(configs, step):
+    lr = jnp.asarray(configs['lr'], dtype=jnp.float32)
+    step_f = jnp.asarray(step, dtype=jnp.float32)
+
+    warmup_steps = int(configs['lr_warmup_steps'])
+    if warmup_steps > 0:
+        warmup = jnp.minimum(1.0, step_f / float(warmup_steps))
+    else:
+        warmup = jnp.asarray(1.0, dtype=jnp.float32)
+
+    decay_steps = int(configs['lr_decay_steps'])
+    min_lr_ratio = float(configs['min_lr_ratio'])
+    if decay_steps > warmup_steps:
+        progress = (step_f - float(warmup_steps)) / float(decay_steps - warmup_steps)
+        progress = jnp.clip(progress, 0.0, 1.0)
+        cosine = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
+        decay = min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+    else:
+        decay = jnp.asarray(1.0, dtype=jnp.float32)
+
+    return lr * jnp.minimum(warmup, decay)
+
+
+def adamWOpt_update(grads, opt_state, configs, params=None):
+    if params is None:
+        raise ValueError("adamWOpt_update requires current params for decoupled weight decay")
+
+    m = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), opt_state['m'])
+    v = jax.tree_util.tree_map(lambda x: x.astype(jnp.float32), opt_state['v'])
+    t = opt_state['t'] + 1
+
+    beta1 = configs['beta1']
+    beta2 = configs['beta2']
+    eps = configs['eps']
+    weight_decay = configs['weight_decay']
+    lr_t = _scheduled_lr(configs, t)
+
+    grads32 = jax.tree_util.tree_map(lambda g: g.astype(jnp.float32), grads)
+    params32 = jax.tree_util.tree_map(lambda p: p.astype(jnp.float32), params)
+
+    m = jax.tree_util.tree_map(
+        lambda m, g: beta1 * m + (1 - beta1) * g,
+        m,
+        grads32,
+    )
+    v = jax.tree_util.tree_map(
+        lambda v, g: beta2 * v + (1 - beta2) * jnp.square(g),
+        v,
+        grads32,
+    )
+    m_hat = jax.tree_util.tree_map(lambda m: m / (1 - jnp.power(beta1, t)), m)
+    v_hat = jax.tree_util.tree_map(lambda v: v / (1 - jnp.power(beta2, t)), v)
+
+    updates = jax.tree_util.tree_map(
+        lambda m_h, v_h, p: lr_t * (
+            m_h / (jnp.sqrt(v_h) + eps) + (weight_decay * p if p.ndim > 1 else 0.0)
+        ),
+        m_hat,
+        v_hat,
+        params32,
+    )
+    new_opt_state = {
+        'm': m,
+        'v': v,
+        't': t,
+    }
+    return updates, new_opt_state
+
+
 def absolute_loss(y_true, y_pred):
     """绝对值损失函数"""
     return jnp.mean(jnp.abs(y_true - y_pred))
@@ -363,7 +482,11 @@ def cross_entropy_loss(y_true, y_pred):
 
 def cross_entropy_loss_indices(y_true_indices, logits, ignore_index=None):
     log_probs = jax.nn.log_softmax(logits, axis=-1)
-    log_likelihood = jnp.take_along_axis(log_probs, y_true_indices[..., jnp.newaxis], axis=-1)
+    if ignore_index is not None:
+        safe_indices = jnp.where(y_true_indices == ignore_index, 0, y_true_indices)
+    else:
+        safe_indices = y_true_indices
+    log_likelihood = jnp.take_along_axis(log_probs, safe_indices[..., jnp.newaxis], axis=-1)
     log_likelihood = jnp.squeeze(log_likelihood, axis=-1)
 
     if ignore_index is None:
