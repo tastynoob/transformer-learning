@@ -56,6 +56,7 @@ def build_meta(
     hyperconnection_mode: str | None = None,
     hyperconnection_dynamic: bool | None = None,
     hyperconnection_sinkhorn_iters: int,
+    attention_implementation: str = "cudnn",
 ) -> dict[str, Any]:
     if d_model % n_heads != 0:
         raise ValueError("d_model must be divisible by n_heads")
@@ -92,6 +93,7 @@ def build_meta(
         "hyperconnection_mode": resolved_hyperconnection_mode,
         "hyperconnection_dynamic": resolved_hyperconnection_dynamic,
         "hyperconnection_sinkhorn_iters": hyperconnection_sinkhorn_iters,
+        "attention_implementation": attention_implementation,
     }
 
 
@@ -203,11 +205,28 @@ def hyperconnection_write_streams(h_post, delta):
     return jnp.einsum("ti,td->itd", h_post, delta)
 
 
-def encoderLayer_delta_apply(x, mask, params, n_heads, drop_prob=0.1, key=None):
-    return encoderLayer_apply(x, mask, params, n_heads, drop_prob, key) - x
+def encoderLayer_delta_apply(
+    x,
+    mask,
+    params,
+    n_heads,
+    drop_prob=0.1,
+    key=None,
+    attention_implementation: str | None = None,
+):
+    return encoderLayer_apply(
+        x,
+        mask,
+        params,
+        n_heads,
+        drop_prob,
+        key,
+        is_causal=True,
+        attention_implementation=attention_implementation,
+    ) - x
 
 
-def attention_sublayer_delta_apply(x, mask, params, n_heads):
+def attention_sublayer_delta_apply(x, mask, params, n_heads, attention_implementation: str | None = None):
     if len(params) == 4:
         attn, norm1, _ffn, _norm2 = params
         attn_res_scale = 1.0
@@ -215,7 +234,16 @@ def attention_sublayer_delta_apply(x, mask, params, n_heads):
         attn, norm1, _ffn, _norm2, attn_res_scale, _ffn_res_scale = params
 
     x_norm = normalize_apply(x, norm1)
-    return attn_res_scale * multiHeadAttention_apply(x_norm, x_norm, x_norm, mask, attn, n_heads)
+    return attn_res_scale * multiHeadAttention_apply(
+        x_norm,
+        x_norm,
+        x_norm,
+        mask,
+        attn,
+        n_heads,
+        is_causal=True,
+        attention_implementation=attention_implementation,
+    )
 
 
 def feedforward_sublayer_delta_apply(x, params, drop_prob=0.1, key=None):
@@ -229,19 +257,51 @@ def feedforward_sublayer_delta_apply(x, params, drop_prob=0.1, key=None):
     return ffn_res_scale * feedforward_apply(x_norm, ffn, drop_prob, key)
 
 
-def hyperconnection_layer_apply(streams, mask, layer, hc_params, n_heads, drop_prob, key, sinkhorn_iters: int):
+def hyperconnection_layer_apply(
+    streams,
+    mask,
+    layer,
+    hc_params,
+    n_heads,
+    drop_prob,
+    key,
+    sinkhorn_iters: int,
+    attention_implementation: str | None = None,
+):
     h_res, h_pre, h_post = hyperconnection_coefficients(hc_params, streams, sinkhorn_iters)
     mixed_streams = hyperconnection_mix_streams(h_res, streams)
     branch_input = hyperconnection_read_streams(h_pre, streams)
-    delta = encoderLayer_delta_apply(branch_input, mask, layer, n_heads, drop_prob, key)
+    delta = encoderLayer_delta_apply(
+        branch_input,
+        mask,
+        layer,
+        n_heads,
+        drop_prob,
+        key,
+        attention_implementation=attention_implementation,
+    )
     return mixed_streams + hyperconnection_write_streams(h_post, delta)
 
 
-def hyperconnection_attention_sublayer_apply(streams, mask, layer, hc_params, n_heads, sinkhorn_iters: int):
+def hyperconnection_attention_sublayer_apply(
+    streams,
+    mask,
+    layer,
+    hc_params,
+    n_heads,
+    sinkhorn_iters: int,
+    attention_implementation: str | None = None,
+):
     h_res, h_pre, h_post = hyperconnection_coefficients(hc_params, streams, sinkhorn_iters)
     mixed_streams = hyperconnection_mix_streams(h_res, streams)
     branch_input = hyperconnection_read_streams(h_pre, streams)
-    delta = attention_sublayer_delta_apply(branch_input, mask, layer, n_heads)
+    delta = attention_sublayer_delta_apply(
+        branch_input,
+        mask,
+        layer,
+        n_heads,
+        attention_implementation=attention_implementation,
+    )
     return mixed_streams + hyperconnection_write_streams(h_post, delta)
 
 
@@ -332,14 +392,14 @@ def lm_apply(
     key=None,
     sinkhorn_iters: int = 8,
     scale_token_embeddings: bool = True,
+    attention_implementation: str | None = None,
 ):
     layers, final_norm, output = unpack_lm_params(params)
     layer_keys = split_key(key, len(layers))
     x = lm_token_embedding_apply(input_ids, output, scale_token_embeddings)
     pe = positionalEncoding_init(input_ids.shape[0], x.shape[-1])
     x = positionalEncoding_encode(x, pe)
-    causal_mask = jnp.tril(jnp.ones((input_ids.shape[0], input_ids.shape[0])))
-    causal_mask = causal_mask[jnp.newaxis, :, :]
+    causal_mask = None
 
     if layers and is_sublayer_hyperconnection_layer(layers[0]):
         n_streams = int(layers[0][1][0].shape[0])
@@ -354,6 +414,7 @@ def lm_apply(
                 attn_hc_params,
                 n_heads,
                 sinkhorn_iters,
+                attention_implementation=attention_implementation,
             )
             streams = hyperconnection_feedforward_sublayer_apply(
                 streams,
@@ -379,10 +440,20 @@ def lm_apply(
                 drop_prob,
                 layer_key,
                 sinkhorn_iters,
+                attention_implementation=attention_implementation,
             )
         return lm_head_apply(jnp.mean(streams, axis=0), output, final_norm)
 
     for layer, layer_key in zip(layers, layer_keys):
-        x = encoderLayer_apply(x, causal_mask, layer, n_heads, drop_prob, layer_key)
+        x = encoderLayer_apply(
+            x,
+            causal_mask,
+            layer,
+            n_heads,
+            drop_prob,
+            layer_key,
+            is_causal=True,
+            attention_implementation=attention_implementation,
+        )
 
     return lm_head_apply(x, output, final_norm)

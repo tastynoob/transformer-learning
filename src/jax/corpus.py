@@ -51,6 +51,8 @@ class TrainingRecord:
     source: str
     segments: tuple[TrainingSegment, ...]
     meta: dict[str, Any]
+    task: str = "auto"
+    rejected_segments: tuple[TrainingSegment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ class TrainingData:
     target_mask: np.ndarray | None = None
     record_spans: np.ndarray | None = None
     pad_id: int = 0
+    record_sampling_cdf: np.ndarray | None = None
 
 
 def normalize_text(text: str) -> str:
@@ -88,14 +91,24 @@ def default_train_for_role(role: str) -> bool:
     return role in {"assistant", "text"}
 
 
-def make_record(
-    record_id: str,
-    source: str,
-    segments: list[dict[str, Any] | TrainingSegment],
-    meta: dict[str, Any] | None = None,
-) -> dict[str, Any]:
+def normalize_task(task: Any, segments: tuple[TrainingSegment, ...], rejected_segments: tuple[TrainingSegment, ...]) -> str:
+    value = coerce_text(task).strip().lower()
+    if value in {"lm", "pretrain", "pretraining", "text"}:
+        return "lm"
+    if value in {"sft", "chat", "instruction"}:
+        return "sft"
+    if value in {"preference", "pref", "dpo", "orpo", "rlhf"}:
+        return "preference"
+    if rejected_segments:
+        return "preference"
+    if any(segment.role != "text" for segment in segments):
+        return "sft"
+    return "lm"
+
+
+def serialize_segments(segments: list[dict[str, Any] | TrainingSegment], source: str = "record") -> list[dict[str, Any]]:
     payload_segments: list[dict[str, Any]] = []
-    for segment in segments:
+    for index, segment in enumerate(segments):
         if isinstance(segment, TrainingSegment):
             role = segment.role
             content = segment.content
@@ -104,32 +117,76 @@ def make_record(
             role = normalize_role(segment.get("role", "text"))
             content = normalize_text(coerce_text(segment.get("content", "")))
             train = bool(segment.get("train", default_train_for_role(role)))
+        if role not in {"system", "user", "assistant", "text"}:
+            raise ValueError(f"{source} segment {index} has unsupported role={role!r}")
         if not content:
             continue
         payload_segments.append({"role": role, "content": content, "train": train})
-    return {
+    return payload_segments
+
+
+def segments_from_payload_list(raw_segments: Any, source: str) -> tuple[TrainingSegment, ...]:
+    if raw_segments is None:
+        return ()
+    if not isinstance(raw_segments, list):
+        raise TypeError(f"{source} segments must be a list")
+    segments = tuple(_segment_from_payload(segment, source) for segment in raw_segments)
+    return tuple(segment for segment in segments if segment.content)
+
+
+def first_present(payload: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in payload:
+            return payload[key]
+    return None
+
+
+def make_record(
+    record_id: str,
+    source: str,
+    segments: list[dict[str, Any] | TrainingSegment],
+    meta: dict[str, Any] | None = None,
+    *,
+    task: str | None = None,
+    rejected_segments: list[dict[str, Any] | TrainingSegment] | None = None,
+) -> dict[str, Any]:
+    payload_segments = serialize_segments(segments)
+    payload_rejected_segments = serialize_segments(rejected_segments or [], "rejected_segments")
+    normalized_task = normalize_task(
+        task,
+        tuple(_segment_from_payload(segment, "segments") for segment in payload_segments),
+        tuple(_segment_from_payload(segment, "rejected_segments") for segment in payload_rejected_segments),
+    )
+    payload = {
         "schema": CORPUS_SCHEMA,
         "id": record_id,
         "source": source,
+        "task": normalized_task,
         "segments": payload_segments,
         "meta": meta or {},
     }
+    if payload_rejected_segments:
+        payload["rejected_segments"] = payload_rejected_segments
+    return payload
 
 
 def record_from_payload(payload: Any, source: str, index: int, text_field: str = "text") -> TrainingRecord:
     if isinstance(payload, dict) and payload.get("schema") == CORPUS_SCHEMA:
-        raw_segments = payload.get("segments", [])
-        if not isinstance(raw_segments, list) or not raw_segments:
-            raise ValueError(f"{source}:{index} has no non-empty segments")
-        segments = tuple(_segment_from_payload(segment, f"{source}:{index}") for segment in raw_segments)
-        segments = tuple(segment for segment in segments if segment.content)
+        raw_segments = first_present(payload, ("segments", "messages", "chosen_segments", "chosen"))
+        segments = segments_from_payload_list(raw_segments, f"{source}:{index}")
         if not segments:
             raise ValueError(f"{source}:{index} has no non-empty segments")
+        rejected_segments = segments_from_payload_list(
+            first_present(payload, ("rejected_segments", "rejected")),
+            f"{source}:{index}:rejected",
+        )
         return TrainingRecord(
             record_id=coerce_text(payload.get("id", str(index))),
             source=coerce_text(payload.get("source", source)),
             segments=segments,
             meta=payload.get("meta", {}) if isinstance(payload.get("meta", {}), dict) else {},
+            task=normalize_task(payload.get("task", payload.get("type", "auto")), segments, rejected_segments),
+            rejected_segments=rejected_segments,
         )
 
     if isinstance(payload, dict):
@@ -140,7 +197,7 @@ def record_from_payload(payload: Any, source: str, index: int, text_field: str =
                 TrainingSegment("user", user, False),
                 TrainingSegment("assistant", assistant, True),
             ]
-            return TrainingRecord(str(index), source, tuple(segment for segment in segments if segment.content), {})
+            return TrainingRecord(str(index), source, tuple(segment for segment in segments if segment.content), {}, "sft")
         if text_field not in payload:
             raise KeyError(f"{source}:{index} does not contain text_field={text_field!r}")
         text = strip_literal_special_tokens(normalize_text(coerce_text(payload[text_field])))
@@ -149,7 +206,7 @@ def record_from_payload(payload: Any, source: str, index: int, text_field: str =
 
     if not text:
         raise ValueError(f"{source}:{index} is empty")
-    return TrainingRecord(str(index), source, (TrainingSegment("text", text, True),), {"legacy_text": True})
+    return TrainingRecord(str(index), source, (TrainingSegment("text", text, True),), {"legacy_text": True}, "lm")
 
 
 def _segment_from_payload(segment: Any, source: str) -> TrainingSegment:
@@ -261,7 +318,7 @@ def read_corpus_records(cfg) -> tuple[list[TrainingRecord], str, int, str]:
     text_field = getattr(cfg, "corpus_text_field", "text")
     if corpus_format == "text":
         text = normalize_text(read_text(cfg.corpus))
-        records = [TrainingRecord("0", str(cfg.corpus), (TrainingSegment("text", text, True),), {})]
+        records = [TrainingRecord("0", str(cfg.corpus), (TrainingSegment("text", text, True),), {}, "lm")]
     elif corpus_format == "jsonl":
         records = []
         for line_no, line in enumerate(read_text(cfg.corpus).splitlines(), start=1):
@@ -297,7 +354,15 @@ def limit_records_by_chars(records: list[TrainingRecord], max_chars: int) -> lis
             continue
         remaining = max_chars - used
         if remaining > 0:
-            out.append(TrainingRecord(record.record_id, record.source, (TrainingSegment("text", rendered[:remaining], True),), record.meta))
+            out.append(
+                TrainingRecord(
+                    record.record_id,
+                    record.source,
+                    (TrainingSegment("text", rendered[:remaining], True),),
+                    record.meta,
+                    "lm",
+                )
+            )
         break
     return out
 
@@ -406,6 +471,44 @@ def load_token_cache_metadata(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def build_record_sampling_cdf(
+    record_spans: np.ndarray | None,
+    target_mask: np.ndarray | None,
+) -> np.ndarray | None:
+    if record_spans is None or len(record_spans) == 0:
+        return None
+
+    starts = record_spans[:, 0].astype(np.int64, copy=False)
+    ends = record_spans[:, 1].astype(np.int64, copy=False)
+    lengths = ends - starts
+    if target_mask is None:
+        weights = np.maximum(lengths - 1, 0)
+    else:
+        target_mask_i64 = target_mask.astype(np.int64, copy=False)
+        prefix = np.concatenate(
+            (
+                np.zeros(1, dtype=np.int64),
+                np.cumsum(target_mask_i64, dtype=np.int64),
+            )
+        )
+        weights = prefix[ends] - prefix[starts + 1]
+        weights = np.maximum(weights, 0)
+
+    if not np.any(weights > 0):
+        raise ValueError("record-aware batching found no trainable target tokens")
+    return np.cumsum(weights, dtype=np.int64)
+
+
+def make_training_data(
+    tokens: np.ndarray,
+    target_mask: np.ndarray | None,
+    record_spans: np.ndarray | None,
+    pad_id: int,
+) -> TrainingData:
+    record_sampling_cdf = build_record_sampling_cdf(record_spans, target_mask)
+    return TrainingData(tokens, target_mask, record_spans, pad_id, record_sampling_cdf)
+
+
 def encode_or_load_training_data(
     cfg,
     tokenizer: HFWordPieceTokenizer,
@@ -434,10 +537,10 @@ def encode_or_load_training_data(
                     else:
                         record_spans = np.load(spans_path).astype(np.int64, copy=False)
                         print(f"loaded token cache: {cfg.token_cache} tokens={len(tokens)}")
-                        return TrainingData(tokens, target_mask, record_spans, tokenizer.pad_id)
+                        return make_training_data(tokens, target_mask, record_spans, tokenizer.pad_id)
                 else:
                     print(f"loaded token cache: {cfg.token_cache} tokens={len(tokens)}")
-                    return TrainingData(tokens, target_mask, None, tokenizer.pad_id)
+                    return make_training_data(tokens, target_mask, None, tokenizer.pad_id)
 
     ids_parts: list[np.ndarray] = []
     mask_parts: list[np.ndarray] = []
@@ -468,7 +571,7 @@ def encode_or_load_training_data(
         f"saved token cache: {cfg.token_cache} tokens={len(ids)} "
         f"records={len(record_spans)} masked_loss={compact_mask is not None}"
     )
-    return TrainingData(ids, compact_mask, record_spans if record_aware_batches else None, tokenizer.pad_id)
+    return make_training_data(ids, compact_mask, record_spans if record_aware_batches else None, tokenizer.pad_id)
 
 
 def encode_record(tokenizer: HFWordPieceTokenizer, record: TrainingRecord, loss_mode: str) -> tuple[np.ndarray, np.ndarray]:
@@ -513,7 +616,7 @@ def random_batch(data: TrainingData, batch_size: int, block_size: int, rng: np.r
 def _sample_record_window(data: TrainingData, block_size: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
     assert data.record_spans is not None
     for _ in range(1024):
-        span_index = int(rng.integers(0, len(data.record_spans)))
+        span_index = sample_record_index(data, rng)
         start, end = (int(v) for v in data.record_spans[span_index])
         length = end - start
         if length < 2:
@@ -543,6 +646,15 @@ def _sample_record_window(data: TrainingData, block_size: int, rng: np.random.Ge
             return x.astype(np.int32, copy=False), y.astype(np.int32, copy=False)
 
     raise ValueError("could not sample a record window with at least one trainable target")
+
+
+def sample_record_index(data: TrainingData, rng: np.random.Generator) -> int:
+    assert data.record_spans is not None
+    if data.record_sampling_cdf is None:
+        return int(rng.integers(0, len(data.record_spans)))
+    total = int(data.record_sampling_cdf[-1])
+    draw = int(rng.integers(0, total))
+    return int(np.searchsorted(data.record_sampling_cdf, draw, side="right"))
 
 
 def _sample_start(

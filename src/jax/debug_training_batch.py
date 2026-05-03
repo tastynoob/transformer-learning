@@ -23,6 +23,7 @@ try:
         load_or_build_tokenizer,
         read_corpus_records,
         render_record,
+        sample_record_index,
     )
     from .tokenizer import HFWordPieceTokenizer
 except ImportError:
@@ -34,6 +35,7 @@ except ImportError:
         load_or_build_tokenizer,
         read_corpus_records,
         render_record,
+        sample_record_index,
     )
     from tokenizer import HFWordPieceTokenizer
 
@@ -126,7 +128,7 @@ def sample_record_window(
         return sample_stream_window(data, block_size, rng)
 
     for _ in range(1024):
-        span_index = int(record_index) if record_index is not None else int(rng.integers(0, len(data.record_spans)))
+        span_index = int(record_index) if record_index is not None else sample_record_index(data, rng)
         start, end = (int(v) for v in data.record_spans[span_index])
         length = end - start
         if length < 2:
@@ -209,10 +211,15 @@ def print_window(
     record_index = info.get("record_index")
     if record_index is not None and 0 <= int(record_index) < len(records):
         record = records[int(record_index)]
-        print(f"\n[record {record_index}] id={record.record_id} source={record.source}")
+        print(f"\n[record {record_index}] id={record.record_id} source={record.source} task={record.task}")
         for seg_index, segment in enumerate(record.segments):
             print(
                 f"  segment {seg_index}: role={segment.role} "
+                f"train={segment.train} chars={len(segment.content)}"
+            )
+        for seg_index, segment in enumerate(record.rejected_segments):
+            print(
+                f"  rejected_segment {seg_index}: role={segment.role} "
                 f"train={segment.train} chars={len(segment.content)}"
             )
         print("\n[rendered record]")

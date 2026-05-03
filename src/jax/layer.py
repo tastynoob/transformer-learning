@@ -1,3 +1,6 @@
+from functools import lru_cache
+import os
+
 import jax
 import jax.numpy as jnp
 
@@ -88,16 +91,61 @@ def relu_apply(x):
 
 #  attention
 
-def scaledDotProduct(q, k, v, mask=None):
+
+@lru_cache(maxsize=None)
+def resolve_attention_implementation(attention_implementation: str | None = None) -> str:
+    impl = (attention_implementation or os.environ.get("JAX_ATTENTION_IMPLEMENTATION", "cudnn")).strip().lower()
+    if impl == "xla":
+        return "xla"
+    if impl == "cudnn":
+        try:
+            if jax.default_backend() == "gpu":
+                device_kind = " ".join(getattr(device, "device_kind", "").lower() for device in jax.devices()[:1])
+                if any(token in device_kind for token in ("nvidia", "cuda", "geforce", "rtx", "quadro", "tesla")):
+                    return "cudnn"
+        except Exception:
+            pass
+        return "xla"
+    if impl not in {"auto", ""}:
+        raise ValueError("attention_implementation must be one of: auto, xla, cudnn")
+
+    try:
+        backend = jax.default_backend()
+        if backend != "gpu":
+            return "xla"
+        device_kind = " ".join(getattr(device, "device_kind", "").lower() for device in jax.devices()[:1])
+        if any(token in device_kind for token in ("nvidia", "cuda", "geforce", "rtx", "quadro", "tesla")):
+            return "cudnn"
+    except Exception:
+        return "xla"
+    return "xla"
+
+
+def scaledDotProduct(q, k, v, mask=None, is_causal: bool = False, attention_implementation: str | None = None):
     """缩放点积注意力机制"""
-    d_k = q.shape[-1]
-    scores = jnp.matmul(q, jnp.swapaxes(k, -2, -1)) / jnp.sqrt(d_k)
-    # scores = jnp.clip(scores, -5, 5)  # 防止数值不稳定
-    if mask is not None:
-        scores = jnp.where(mask == 0, -1e9, scores)
-    attn_weights = jax.nn.softmax(scores, axis=-1)
-    output = jnp.matmul(attn_weights, v)
-    return output
+    implementation = resolve_attention_implementation(attention_implementation)
+    attn_mask = None if mask is None else mask.astype(bool)
+    if attn_mask is not None and attn_mask.ndim == 2:
+        attn_mask = attn_mask[jnp.newaxis, :, :]
+    if q.ndim == 2:
+        output = jax.nn.dot_product_attention(
+            q[:, None, :],
+            k[:, None, :],
+            v[:, None, :],
+            mask=attn_mask,
+            is_causal=is_causal,
+            implementation=implementation,
+        )
+        return output[:, 0, :]
+
+    return jax.nn.dot_product_attention(
+        q,
+        k,
+        v,
+        mask=attn_mask,
+        is_causal=is_causal,
+        implementation=implementation,
+    )
 
 def selfAttention_init(key, d_model, d_k, d_v):
     """初始化自注意力机制的参数"""
@@ -108,13 +156,13 @@ def selfAttention_init(key, d_model, d_k, d_v):
     lin_o = linear_init(k4, d_v, d_model)
     return lin_q, lin_k, lin_v, lin_o
 
-def selfAttention_apply(x, mask, params):
+def selfAttention_apply(x, mask, params, is_causal: bool = False, attention_implementation: str | None = None):
     """自注意力机制的前向传播"""
     lin_q, lin_k, lin_v, lin_o = params
     q = linear_apply(x, lin_q)
     k = linear_apply(x, lin_k)
     v = linear_apply(x, lin_v)
-    attn_output = scaledDotProduct(q, k, v, mask)
+    attn_output = scaledDotProduct(q, k, v, mask, is_causal=is_causal, attention_implementation=attention_implementation)
     output = linear_apply(attn_output, lin_o)
     return output
 
@@ -127,7 +175,17 @@ def multiHeadAttention_init(key, d_model, d_k, d_v, n_heads):
     lin_o = linear_init(k4, d_v * n_heads, d_model)
     return lin_q, lin_k, lin_v, lin_o
 
-def multiHeadAttention_apply(q, k, v, mask, params, n_heads):
+def multiHeadAttention_apply(
+    q,
+    k,
+    v,
+    mask,
+    params,
+    n_heads,
+    *,
+    is_causal: bool = False,
+    attention_implementation: str | None = None,
+):
     """多头注意力机制的前向传播"""
     '''
     q : (seqlen, q_dim)
@@ -146,13 +204,20 @@ def multiHeadAttention_apply(q, k, v, mask, params, n_heads):
     k_proj = linear_apply(k, lin_k)
     v_proj = linear_apply(v, lin_v)
 
-    q_heads = q_proj.reshape(q_seqlen, n_heads, d_k).transpose(1, 0, 2)
-    k_heads = k_proj.reshape(k_seqlen, n_heads, d_k).transpose(1, 0, 2)
-    v_heads = v_proj.reshape(v_seqlen, n_heads, d_v).transpose(1, 0, 2)
+    q_heads = q_proj.reshape(q_seqlen, n_heads, d_k)
+    k_heads = k_proj.reshape(k_seqlen, n_heads, d_k)
+    v_heads = v_proj.reshape(v_seqlen, n_heads, d_v)
 
-    attn_output = scaledDotProduct(q_heads, k_heads, v_heads, mask)
+    attn_output = scaledDotProduct(
+        q_heads,
+        k_heads,
+        v_heads,
+        mask,
+        is_causal=is_causal,
+        attention_implementation=attention_implementation,
+    )
 
-    concat_attn = attn_output.transpose(1, 0, 2).reshape(q_seqlen, -1)
+    concat_attn = attn_output.reshape(q_seqlen, -1)
     
     output = linear_apply(concat_attn, lin_o)
     return output
@@ -165,7 +230,17 @@ def encoderLayer_init(key, d_model, d_ff, d_k, d_v, n_heads):
     norm2 = normalize_init(d_model)
     return attn, norm1, ffn, norm2
 
-def encoderLayer_apply(x, mask, params, n_heads, drop_prob=0.1, key=None):
+def encoderLayer_apply(
+    x,
+    mask,
+    params,
+    n_heads,
+    drop_prob=0.1,
+    key=None,
+    *,
+    is_causal: bool = False,
+    attention_implementation: str | None = None,
+):
     if len(params) == 4:
         attn, norm1, ffn, norm2 = params
         attn_res_scale = 1.0
@@ -174,7 +249,16 @@ def encoderLayer_apply(x, mask, params, n_heads, drop_prob=0.1, key=None):
         attn, norm1, ffn, norm2, attn_res_scale, ffn_res_scale = params
 
     x_norm = normalize_apply(x, norm1)
-    a = multiHeadAttention_apply(x_norm, x_norm, x_norm, mask, attn, n_heads)
+    a = multiHeadAttention_apply(
+        x_norm,
+        x_norm,
+        x_norm,
+        mask,
+        attn,
+        n_heads,
+        is_causal=is_causal,
+        attention_implementation=attention_implementation,
+    )
     a = x + attn_res_scale * a
 
     a_norm = normalize_apply(a, norm2)
@@ -192,7 +276,18 @@ def decoderLayer_init(key, d_model, d_ff, d_k, d_v, n_heads):
     norm3 = normalize_init(d_model)
     return self_attn, norm1, cross_attn, norm2, ffn, norm3
 
-def decoderLayer_apply(x, enc_output, lookahead_mask, enc_padding_mask, params, n_heads, drop_prob=0.1, key=None):
+def decoderLayer_apply(
+    x,
+    enc_output,
+    lookahead_mask,
+    enc_padding_mask,
+    params,
+    n_heads,
+    drop_prob=0.1,
+    key=None,
+    *,
+    attention_implementation: str | None = None,
+):
     if len(params) == 6:
         self_attn, norm1, cross_attn, norm2, ffn, norm3 = params
         self_attn_res_scale = 1.0
@@ -202,11 +297,28 @@ def decoderLayer_apply(x, enc_output, lookahead_mask, enc_padding_mask, params, 
         self_attn, norm1, cross_attn, norm2, ffn, norm3, self_attn_res_scale, cross_attn_res_scale, ffn_res_scale = params
 
     x_norm = normalize_apply(x, norm1)
-    a = multiHeadAttention_apply(x_norm, x_norm, x_norm, lookahead_mask, self_attn, n_heads)
+    a = multiHeadAttention_apply(
+        x_norm,
+        x_norm,
+        x_norm,
+        lookahead_mask,
+        self_attn,
+        n_heads,
+        is_causal=True,
+        attention_implementation=attention_implementation,
+    )
     a = x + self_attn_res_scale * a
 
     a_norm = normalize_apply(a, norm2)
-    b = multiHeadAttention_apply(a_norm, enc_output, enc_output, enc_padding_mask, cross_attn, n_heads)
+    b = multiHeadAttention_apply(
+        a_norm,
+        enc_output,
+        enc_output,
+        enc_padding_mask,
+        cross_attn,
+        n_heads,
+        attention_implementation=attention_implementation,
+    )
     b = a + cross_attn_res_scale * b
 
     b_norm = normalize_apply(b, norm3)

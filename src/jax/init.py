@@ -10,23 +10,33 @@ from pathlib import Path
 class TextLMConfig:
     # =========================================================================
     # Mutable hot knobs.
-    # 最常改的参数放在最上面。切换 corpus/loss_mode/block_size 时建议同步换
+    # 最常改的参数放在最上面。切换 corpus/loss_mode/loss_objective/block_size 时建议同步换
     # out_dir/token_cache/checkpoint，避免不同训练口径混到同一个 run。
     # =========================================================================
-    # Use src/jax/convert_corpus.py to normalize source corpora into this JSONL schema.
-    corpus: Path = Path("data/corpus/daily_dialog_train.tl.jsonl")
+    # Use src/jax/prepare_dialogue_logic_mix_corpus.py to build this JSONL corpus.
+    corpus: Path = Path("data/corpus/dialogue_logic_mix_1024.tl.jsonl")
     # record: use each normalized segment's train flag; assistant: train only assistant tokens; all: pretrain-style LM.
     loss_mode: str = "record"
-    block_size: int = 512
+    # ce: standard SFT/NLL; dft: pure Dynamic Fine-Tuning; ce_dft: stable CE+DFT mixture.
+    loss_objective: str = "ce_dft"
+    dft_alpha: float = 0.2
+    dft_start_step: int = 0
+    dft_warmup_steps: int = 2000
+    label_smoothing: float = 0.01
+    block_size: int = 1024
     steps: int = 80000
-    batch_size: int = 2
-    lr: float = 1e-4
-    out_dir: Path = Path("runs/jax_text_lm_daily_dialog")
-    tokenizer_json: Path = Path("runs/jax_text_lm_daily_dialog/tokenizer.json")
-    token_cache: Path = Path("runs/jax_text_lm_daily_dialog/tokens.npy")
-    checkpoint: Path = Path("runs/jax_text_lm_daily_dialog/checkpoint.pkl")
-    init_checkpoint: Path | None = None
-    init_tokenizer_json: Path | None = None
+    batch_size: int = 16
+    lr: float = 5e-5
+    attention_implementation: str = "cudnn"
+
+    out_dir: Path = Path("runs/jax_text_lm_dialogue_logic_mix_1024")
+    tokenizer_json: Path = Path("runs/jax_text_lm_dialogue_logic_mix_1024/tokenizer.json")
+    token_cache: Path = Path("runs/jax_text_lm_dialogue_logic_mix_1024/tokens.npy")
+    checkpoint: Path = Path("runs/jax_text_lm_dialogue_logic_mix_1024/checkpoint.pkl")
+
+    init_checkpoint: Path | None = None # Path("runs/mode_en/checkpoint.pkl")
+    init_tokenizer_json: Path | None = None # Path("runs/mode_en/tokenizer.json")
+
     seed: int = 0
     jax_platforms: str | None = "gpu"
 
@@ -61,7 +71,7 @@ class TextLMConfig:
     # Mutable logging, checkpointing, validation, and preview.
     # 只影响观测、保存频率、dry-run 和训练结束后的 sample 预览。
     # =========================================================================
-    save_every: int = 500
+    save_every: int = 100
     log_every: int = 10
     eval_batches: int = 10
     dry_run: bool = False
@@ -88,9 +98,9 @@ class TextLMConfig:
     # 这些影响 checkpoint 结构或 forward 语义；改了通常要新建模型。
     # =========================================================================
     d_model: int = 512
-    n_heads: int = 8
+    n_heads: int = 4
     d_ff: int = 2048
-    n_layers: int = 6
+    n_layers: int = 8
 
     # Fixed sinusoidal position encodings have O(1) amplitude, so token
     # embeddings need the original Transformer sqrt(d_model) scale.

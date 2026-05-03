@@ -29,9 +29,10 @@ try:
     from .corpus import encode_or_load_training_data, load_or_build_tokenizer, random_batch, read_corpus_records
     from .lm_model import build_meta
     from .trainer import (
-        estimate_loss,
+        estimate_losses,
         generate_text,
         init_or_load_state,
+        normalize_loss_objective,
         save_checkpoint,
         seed_everything,
         train_step,
@@ -41,9 +42,10 @@ except ImportError:
     from corpus import encode_or_load_training_data, load_or_build_tokenizer, random_batch, read_corpus_records
     from lm_model import build_meta
     from trainer import (
-        estimate_loss,
+        estimate_losses,
         generate_text,
         init_or_load_state,
+        normalize_loss_objective,
         save_checkpoint,
         seed_everything,
         train_step,
@@ -69,6 +71,7 @@ def build_model_meta(cfg, vocab_size: int) -> dict:
         hyperconnection_mode=getattr(cfg, "hyperconnection_mode", None),
         hyperconnection_dynamic=getattr(cfg, "hyperconnection_dynamic", None),
         hyperconnection_sinkhorn_iters=cfg.hyperconnection_sinkhorn_iters,
+        attention_implementation=getattr(cfg, "attention_implementation", "cudnn"),
     )
 
 
@@ -99,6 +102,15 @@ def main(cfg: TextLMConfig = CFG) -> None:
     meta = build_model_meta(cfg, tokenizer.vocab_size)
     write_run_config(cfg.out_dir / "run_config.json", cfg, meta, tokenizer, len(training_data.tokens), CONFIG_SOURCE)
     print("model meta:", meta)
+    if (
+        getattr(cfg, "loss_objective", "ce").lower() == "dft"
+        and cfg.init_checkpoint is None
+        and not cfg.checkpoint.exists()
+    ):
+        print(
+            "warning: loss_objective=dft is intended for fine-tuning from a pretrained checkpoint; "
+            "from-scratch training usually should start with ce"
+        )
 
     if cfg.dry_run:
         x, y = random_batch(training_data, min(cfg.batch_size, 2), cfg.block_size, np.random.default_rng(cfg.seed))
@@ -117,16 +129,47 @@ def main(cfg: TextLMConfig = CFG) -> None:
     )
     rng = np.random.default_rng(cfg.seed + start_step)
     start_time = time.time()
+    ema_loss: float | None = None
+    ema_ce_loss: float | None = None
+    loss_objective = normalize_loss_objective(getattr(cfg, "loss_objective", "ce"))
+    label_smoothing = float(getattr(cfg, "label_smoothing", 0.0))
+    log_smoothing_metrics = loss_objective in {"ce", "ce_dft"} and label_smoothing > 0.0
+    log_dft_metrics = loss_objective in {"dft", "ce_dft"}
 
     for step in range(start_step + 1, cfg.steps + 1):
         x, y = random_batch(training_data, cfg.batch_size, cfg.block_size, rng)
         key, subkey = jax.random.split(key)
-        state, loss = train_step(x, y, state, configs, subkey)
+        state, metrics = train_step(x, y, state, configs, subkey, step)
 
         if step == 1 or step % cfg.log_every == 0:
+            loss = metrics["loss"]
             loss.block_until_ready()
+            loss_value = float(loss)
+            ce_loss_value = float(metrics["ce_loss"])
+            ema_loss = loss_value if ema_loss is None else 0.9 * ema_loss + 0.1 * loss_value
+            ema_ce_loss = ce_loss_value if ema_ce_loss is None else 0.9 * ema_ce_loss + 0.1 * ce_loss_value
             elapsed = time.time() - start_time
-            print(f"step={step} loss={float(loss):.4f} elapsed={elapsed:.1f}s")
+            log_line = f"step={step} loss={loss_value:.4f} loss_ema={ema_loss:.4f}"
+            if log_smoothing_metrics or log_dft_metrics:
+                log_line += (
+                    f" ce_loss={ce_loss_value:.4f} ce_ema={ema_ce_loss:.4f}"
+                )
+            if log_smoothing_metrics:
+                log_line += (
+                    f" smooth_ce={float(metrics['smoothed_ce_loss']):.4f}"
+                    f" label_smoothing={float(metrics['label_smoothing']):.3f}"
+                )
+            if log_dft_metrics:
+                log_line += (
+                    f" dft_loss={float(metrics['dft_loss']):.4f}"
+                    f" dft_alpha={float(metrics['dft_alpha']):.3f}"
+                    f" p_gold={float(metrics['mean_gold_prob']):.4f}"
+                )
+            if log_smoothing_metrics or log_dft_metrics:
+                log_line += (
+                    f" valid_tokens={int(float(metrics['valid_tokens']))}"
+                )
+            print(f"{log_line} elapsed={elapsed:.1f}s")
 
         if step % cfg.save_every == 0 or step == cfg.steps:
             save_checkpoint(cfg.checkpoint, state, meta, step, cfg)
@@ -134,7 +177,24 @@ def main(cfg: TextLMConfig = CFG) -> None:
 
     if cfg.eval_batches > 0:
         key, subkey = jax.random.split(key)
-        print(f"eval_loss={estimate_loss(training_data, state, configs, subkey, cfg):.4f}")
+        eval_metrics = estimate_losses(training_data, state, configs, subkey, cfg, step=cfg.steps)
+        eval_line = f"eval_loss={eval_metrics['loss']:.4f}"
+        if log_smoothing_metrics or log_dft_metrics:
+            eval_line += (
+                f" eval_ce_loss={eval_metrics['ce_loss']:.4f}"
+            )
+        if log_smoothing_metrics:
+            eval_line += (
+                f" eval_smooth_ce={eval_metrics['smoothed_ce_loss']:.4f}"
+                f" eval_label_smoothing={eval_metrics['label_smoothing']:.3f}"
+            )
+        if log_dft_metrics:
+            eval_line += (
+                f" eval_dft_loss={eval_metrics['dft_loss']:.4f}"
+                f" eval_dft_alpha={eval_metrics['dft_alpha']:.3f}"
+                f" eval_p_gold={eval_metrics['mean_gold_prob']:.4f}"
+            )
+        print(eval_line)
 
     if cfg.sample_prompt:
         print(

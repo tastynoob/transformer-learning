@@ -6,16 +6,23 @@ Output schema, one JSON object per line:
   "schema": "tl-corpus-v1",
   "id": "example-000001",
   "source": "source name or path",
+  "task": "lm | sft | preference",
   "segments": [
     {"role": "user", "content": "...", "train": false},
     {"role": "assistant", "content": "...", "train": true}
+  ],
+  "rejected_segments": [
+    {"role": "user", "content": "...", "train": false},
+    {"role": "assistant", "content": "bad answer", "train": true}
   ],
   "meta": {}
 }
 
 Roles are system, user, assistant, or text. During training, loss_mode=record
 uses each segment's train flag; text/pretrain segments train all tokens, while
-chat/SFT records normally train assistant tokens only.
+chat/SFT records normally train assistant tokens only. rejected_segments is
+optional and is ignored by plain LM/SFT training; preference trainers can use it
+without requiring a second corpus schema.
 """
 
 from __future__ import annotations
@@ -93,6 +100,52 @@ def segments_from_messages(messages: Any) -> list[TrainingSegment]:
     return segments
 
 
+def segments_from_prompt(value: Any, args: argparse.Namespace) -> list[TrainingSegment]:
+    if isinstance(value, list):
+        return segments_from_messages(value)
+    if isinstance(value, dict):
+        if args.messages_field in value:
+            return segments_from_messages(value.get(args.messages_field))
+        if "messages" in value:
+            return segments_from_messages(value.get("messages"))
+        if "conversations" in value:
+            return segments_from_messages(value.get("conversations"))
+        if "role" in value or "from" in value:
+            return segments_from_messages([value])
+        if args.text_field in value:
+            value = value.get(args.text_field)
+    content = normalize_text(coerce_text(value))
+    return [TrainingSegment("user", content, False)] if content else []
+
+
+def segments_from_response(value: Any, args: argparse.Namespace) -> list[TrainingSegment]:
+    if isinstance(value, list):
+        return segments_from_messages(value)
+    if isinstance(value, dict):
+        if args.messages_field in value:
+            return segments_from_messages(value.get(args.messages_field))
+        if "messages" in value:
+            return segments_from_messages(value.get("messages"))
+        if "conversations" in value:
+            return segments_from_messages(value.get("conversations"))
+        if "role" in value or "from" in value:
+            return segments_from_messages([value])
+        if args.output_field in value:
+            value = value.get(args.output_field)
+        elif args.text_field in value:
+            value = value.get(args.text_field)
+    content = normalize_text(coerce_text(value))
+    return [TrainingSegment("assistant", content, True)] if content else []
+
+
+def compose_preference_branch(prompt_segments: list[TrainingSegment], response_segments: list[TrainingSegment]) -> list[TrainingSegment]:
+    if not prompt_segments:
+        return response_segments
+    if response_segments and response_segments[0].role in {"system", "user"}:
+        return response_segments
+    return prompt_segments + response_segments
+
+
 def segments_from_instruction(record: dict[str, Any], args: argparse.Namespace) -> list[TrainingSegment]:
     instruction = normalize_text(coerce_text(record.get(args.instruction_field, "")))
     input_text = normalize_text(coerce_text(record.get(args.input_field, "")))
@@ -161,7 +214,38 @@ def convert_payload(payload: Any, line_no: int, args: argparse.Namespace) -> lis
     record_id = f"{args.id_prefix}-{line_no:06d}"
     if isinstance(payload, dict) and payload.get("schema") == CORPUS_SCHEMA:
         record = record_from_payload(payload, source, line_no, args.text_field)
-        return [make_record(record.record_id, record.source, list(record.segments), record.meta)]
+        return [
+            make_record(
+                record.record_id,
+                record.source,
+                list(record.segments),
+                record.meta,
+                task=record.task,
+                rejected_segments=list(record.rejected_segments),
+            )
+        ]
+
+    if isinstance(payload, dict) and "chosen" in payload and "rejected" in payload:
+        prompt = payload.get("prompt", payload.get(args.input_field, payload.get(args.messages_field)))
+        prompt_segments = segments_from_prompt(prompt, args)
+        chosen_segments = segments_from_response(payload.get("chosen"), args)
+        rejected_segments = segments_from_response(payload.get("rejected"), args)
+        positive = compose_preference_branch(prompt_segments, chosen_segments)
+        negative = compose_preference_branch(prompt_segments, rejected_segments)
+        positive = truncate_segments(positive, args.max_chars_per_record)
+        negative = truncate_segments(negative, args.max_chars_per_record)
+        if positive and negative:
+            return [
+                make_record(
+                    record_id,
+                    source,
+                    positive,
+                    {"source_line": line_no},
+                    task="preference",
+                    rejected_segments=negative,
+                )
+            ]
+        return []
 
     segments: list[TrainingSegment] = []
     if isinstance(payload, dict):

@@ -144,6 +144,7 @@ try:
         normalize_apply,
         positionalEncoding_encode,
         positionalEncoding_init,
+        resolve_attention_implementation,
         split_key,
     )
     from .tokenizer import HFWordPieceTokenizer
@@ -157,6 +158,7 @@ except ImportError:
         normalize_apply,
         positionalEncoding_encode,
         positionalEncoding_init,
+        resolve_attention_implementation,
         split_key,
     )
     from tokenizer import HFWordPieceTokenizer
@@ -287,11 +289,23 @@ def lm_head_apply(x, output, final_norm):
     return linear_apply(x, output)
 
 
-def encoderLayer_delta_apply(x, mask, params, n_heads):
-    return encoderLayer_apply(x, mask, params, n_heads, -1.0, None) - x
+def encoderLayer_delta_apply(x, mask, params, n_heads, attention_implementation: str | None = None):
+    return (
+        encoderLayer_apply(
+            x,
+            mask,
+            params,
+            n_heads,
+            -1.0,
+            None,
+            is_causal=True,
+            attention_implementation=attention_implementation,
+        )
+        - x
+    )
 
 
-def attention_sublayer_delta_apply(x, mask, params, n_heads):
+def attention_sublayer_delta_apply(x, mask, params, n_heads, attention_implementation: str | None = None):
     if len(params) == 4:
         attn, norm1, _ffn, _norm2 = params
         attn_res_scale = 1.0
@@ -299,7 +313,16 @@ def attention_sublayer_delta_apply(x, mask, params, n_heads):
         attn, norm1, _ffn, _norm2, attn_res_scale, _ffn_res_scale = params
 
     x_norm = normalize_apply(x, norm1)
-    return attn_res_scale * multiHeadAttention_apply(x_norm, x_norm, x_norm, mask, attn, n_heads)
+    return attn_res_scale * multiHeadAttention_apply(
+        x_norm,
+        x_norm,
+        x_norm,
+        mask,
+        attn,
+        n_heads,
+        is_causal=True,
+        attention_implementation=attention_implementation,
+    )
 
 
 def feedforward_sublayer_delta_apply(x, params):
@@ -313,19 +336,47 @@ def feedforward_sublayer_delta_apply(x, params):
     return ffn_res_scale * feedforward_apply(x_norm, ffn, -1.0, None)
 
 
-def hyperconnection_layer_apply(streams, mask, layer, hc_params, n_heads, sinkhorn_iters: int):
+def hyperconnection_layer_apply(
+    streams,
+    mask,
+    layer,
+    hc_params,
+    n_heads,
+    sinkhorn_iters: int,
+    attention_implementation: str | None = None,
+):
     h_res, h_pre, h_post = hyperconnection_coefficients(hc_params, streams, sinkhorn_iters)
     mixed_streams = hyperconnection_mix_streams(h_res, streams)
     branch_input = hyperconnection_read_streams(h_pre, streams)
-    delta = encoderLayer_delta_apply(branch_input, mask, layer, n_heads)
+    delta = encoderLayer_delta_apply(
+        branch_input,
+        mask,
+        layer,
+        n_heads,
+        attention_implementation=attention_implementation,
+    )
     return mixed_streams + hyperconnection_write_streams(h_post, delta)
 
 
-def hyperconnection_attention_sublayer_apply(streams, mask, layer, hc_params, n_heads, sinkhorn_iters: int):
+def hyperconnection_attention_sublayer_apply(
+    streams,
+    mask,
+    layer,
+    hc_params,
+    n_heads,
+    sinkhorn_iters: int,
+    attention_implementation: str | None = None,
+):
     h_res, h_pre, h_post = hyperconnection_coefficients(hc_params, streams, sinkhorn_iters)
     mixed_streams = hyperconnection_mix_streams(h_res, streams)
     branch_input = hyperconnection_read_streams(h_pre, streams)
-    delta = attention_sublayer_delta_apply(branch_input, mask, layer, n_heads)
+    delta = attention_sublayer_delta_apply(
+        branch_input,
+        mask,
+        layer,
+        n_heads,
+        attention_implementation=attention_implementation,
+    )
     return mixed_streams + hyperconnection_write_streams(h_post, delta)
 
 
@@ -342,15 +393,15 @@ def lm_apply(
     params,
     n_heads: int,
     pe,
-    causal_mask,
     sinkhorn_iters: int = 8,
     scale_token_embeddings: bool = True,
+    attention_implementation: str | None = None,
 ):
     layers, final_norm, output = unpack_lm_params(params)
     layer_keys = split_key(None, len(layers))
     x = lm_token_embedding_apply(input_ids, output, scale_token_embeddings)
     x = positionalEncoding_encode(x, pe)
-    mask = causal_mask[:, : input_ids.shape[0], : input_ids.shape[0]]
+    mask = None
 
     if layers and is_sublayer_hyperconnection_layer(layers[0]):
         n_streams = int(layers[0][1][0].shape[0])
@@ -364,6 +415,7 @@ def lm_apply(
                 attn_hc_params,
                 n_heads,
                 sinkhorn_iters,
+                attention_implementation=attention_implementation,
             )
             streams = hyperconnection_feedforward_sublayer_apply(streams, layer, ffn_hc_params, sinkhorn_iters)
         return lm_head_apply(jnp.mean(streams, axis=0), output, final_norm)
@@ -373,11 +425,28 @@ def lm_apply(
         streams = jnp.broadcast_to(x, (n_streams,) + x.shape)
         for layer_with_hc in layers:
             layer, hc_params = layer_with_hc
-            streams = hyperconnection_layer_apply(streams, mask, layer, hc_params, n_heads, sinkhorn_iters)
+            streams = hyperconnection_layer_apply(
+                streams,
+                mask,
+                layer,
+                hc_params,
+                n_heads,
+                sinkhorn_iters,
+                attention_implementation=attention_implementation,
+            )
         return lm_head_apply(jnp.mean(streams, axis=0), output, final_norm)
 
     for layer, layer_key in zip(layers, layer_keys):
-        x = encoderLayer_apply(x, mask, layer, n_heads, -1.0, layer_key)
+        x = encoderLayer_apply(
+            x,
+            mask,
+            layer,
+            n_heads,
+            -1.0,
+            layer_key,
+            is_causal=True,
+            attention_implementation=attention_implementation,
+        )
 
     return lm_head_apply(x, output, final_norm)
 
@@ -393,7 +462,7 @@ def _append_kv(cache_entry, k_new, v_new):
     return jnp.concatenate([k_cache, k_new], axis=1), jnp.concatenate([v_cache, v_new], axis=1)
 
 
-def cached_attention_step(x, params, cache_entry, n_heads: int):
+def cached_attention_step(x, params, cache_entry, n_heads: int, attention_implementation: str | None = None):
     lin_q, lin_k, lin_v, lin_o = params
     d_k = lin_k[0].shape[1] // n_heads
     d_v = lin_v[0].shape[1] // n_heads
@@ -403,13 +472,19 @@ def cached_attention_step(x, params, cache_entry, n_heads: int):
     v_new = linear_apply(x, lin_v).reshape(1, n_heads, d_v).transpose(1, 0, 2)
     k_all, v_all = _append_kv(cache_entry, k_new, v_new)
 
-    scores = jnp.matmul(q, jnp.swapaxes(k_all, -2, -1)) / jnp.sqrt(d_k)
-    attn = jax.nn.softmax(scores, axis=-1)
-    output = jnp.matmul(attn, v_all).transpose(1, 0, 2).reshape(1, -1)
+    implementation = resolve_attention_implementation(attention_implementation)
+    attn = jax.nn.dot_product_attention(
+        jnp.transpose(q, (1, 0, 2)),
+        jnp.transpose(k_all, (1, 0, 2)),
+        jnp.transpose(v_all, (1, 0, 2)),
+        is_causal=True,
+        implementation=implementation,
+    )
+    output = jnp.transpose(attn, (1, 0, 2)).reshape(1, -1)
     return linear_apply(output, lin_o), (k_all, v_all)
 
 
-def cached_layer_step(x, params, cache_entry, n_heads: int):
+def cached_layer_step(x, params, cache_entry, n_heads: int, attention_implementation: str | None = None):
     if len(params) == 4:
         attn, norm1, ffn, norm2 = params
         attn_res_scale = 1.0
@@ -418,7 +493,13 @@ def cached_layer_step(x, params, cache_entry, n_heads: int):
         attn, norm1, ffn, norm2, attn_res_scale, ffn_res_scale = params
 
     x_norm = normalize_apply(x, norm1)
-    attn_out, new_cache_entry = cached_attention_step(x_norm, attn, cache_entry, n_heads)
+    attn_out, new_cache_entry = cached_attention_step(
+        x_norm,
+        attn,
+        cache_entry,
+        n_heads,
+        attention_implementation=attention_implementation,
+    )
     a = x + attn_res_scale * attn_out
 
     a_norm = normalize_apply(a, norm2)
@@ -426,12 +507,18 @@ def cached_layer_step(x, params, cache_entry, n_heads: int):
     return b, new_cache_entry
 
 
-def cached_layer_delta_step(x, params, cache_entry, n_heads: int):
-    y, new_cache_entry = cached_layer_step(x, params, cache_entry, n_heads)
+def cached_layer_delta_step(x, params, cache_entry, n_heads: int, attention_implementation: str | None = None):
+    y, new_cache_entry = cached_layer_step(
+        x,
+        params,
+        cache_entry,
+        n_heads,
+        attention_implementation=attention_implementation,
+    )
     return y - x, new_cache_entry
 
 
-def cached_attention_sublayer_delta_step(x, params, cache_entry, n_heads: int):
+def cached_attention_sublayer_delta_step(x, params, cache_entry, n_heads: int, attention_implementation: str | None = None):
     if len(params) == 4:
         attn, norm1, _ffn, _norm2 = params
         attn_res_scale = 1.0
@@ -439,7 +526,13 @@ def cached_attention_sublayer_delta_step(x, params, cache_entry, n_heads: int):
         attn, norm1, _ffn, _norm2, attn_res_scale, _ffn_res_scale = params
 
     x_norm = normalize_apply(x, norm1)
-    attn_out, new_cache_entry = cached_attention_step(x_norm, attn, cache_entry, n_heads)
+    attn_out, new_cache_entry = cached_attention_step(
+        x_norm,
+        attn,
+        cache_entry,
+        n_heads,
+        attention_implementation=attention_implementation,
+    )
     return attn_res_scale * attn_out, new_cache_entry
 
 
@@ -454,11 +547,25 @@ def cached_feedforward_sublayer_delta_step(x, params):
     return ffn_res_scale * feedforward_apply(x_norm, ffn, -1.0, None)
 
 
-def cached_hyperconnection_layer_step(streams, layer, hc_params, cache_entry, n_heads: int, sinkhorn_iters: int):
+def cached_hyperconnection_layer_step(
+    streams,
+    layer,
+    hc_params,
+    cache_entry,
+    n_heads: int,
+    sinkhorn_iters: int,
+    attention_implementation: str | None = None,
+):
     h_res, h_pre, h_post = hyperconnection_coefficients(hc_params, streams, sinkhorn_iters)
     mixed_streams = hyperconnection_mix_streams(h_res, streams)
     branch_input = hyperconnection_read_streams(h_pre, streams)
-    delta, new_cache_entry = cached_layer_delta_step(branch_input, layer, cache_entry, n_heads)
+    delta, new_cache_entry = cached_layer_delta_step(
+        branch_input,
+        layer,
+        cache_entry,
+        n_heads,
+        attention_implementation=attention_implementation,
+    )
     return mixed_streams + hyperconnection_write_streams(h_post, delta), new_cache_entry
 
 
@@ -469,11 +576,18 @@ def cached_hyperconnection_attention_sublayer_step(
     cache_entry,
     n_heads: int,
     sinkhorn_iters: int,
+    attention_implementation: str | None = None,
 ):
     h_res, h_pre, h_post = hyperconnection_coefficients(hc_params, streams, sinkhorn_iters)
     mixed_streams = hyperconnection_mix_streams(h_res, streams)
     branch_input = hyperconnection_read_streams(h_pre, streams)
-    delta, new_cache_entry = cached_attention_sublayer_delta_step(branch_input, layer, cache_entry, n_heads)
+    delta, new_cache_entry = cached_attention_sublayer_delta_step(
+        branch_input,
+        layer,
+        cache_entry,
+        n_heads,
+        attention_implementation=attention_implementation,
+    )
     return mixed_streams + hyperconnection_write_streams(h_post, delta), new_cache_entry
 
 
@@ -487,6 +601,7 @@ def cached_hyperconnection_feedforward_sublayer_step(streams, layer, hc_params, 
 
 def cached_lm_step(token_id: int, pos: int, cache, params, meta: dict[str, Any], pe):
     layers, final_norm, output = unpack_lm_params(params)
+    attention_implementation = meta.get("attention_implementation", "cudnn")
     x = lm_token_embedding_apply(
         jnp.asarray([token_id], dtype=jnp.int32),
         output,
@@ -507,6 +622,7 @@ def cached_lm_step(token_id: int, pos: int, cache, params, meta: dict[str, Any],
                 cache_entry,
                 int(meta["n_heads"]),
                 int(meta.get("hyperconnection_sinkhorn_iters", 8)),
+                attention_implementation=attention_implementation,
             )
             streams = cached_hyperconnection_feedforward_sublayer_step(
                 streams,
@@ -530,13 +646,20 @@ def cached_lm_step(token_id: int, pos: int, cache, params, meta: dict[str, Any],
                 cache_entry,
                 int(meta["n_heads"]),
                 int(meta.get("hyperconnection_sinkhorn_iters", 8)),
+                attention_implementation=attention_implementation,
             )
             new_cache.append(new_cache_entry)
         return lm_head_apply(jnp.mean(streams, axis=0), output, final_norm), new_cache
 
     new_cache = []
     for layer, cache_entry in zip(layers, cache):
-        x, new_cache_entry = cached_layer_step(x, layer, cache_entry, int(meta["n_heads"]))
+        x, new_cache_entry = cached_layer_step(
+            x,
+            layer,
+            cache_entry,
+            int(meta["n_heads"]),
+            attention_implementation=attention_implementation,
+        )
         new_cache.append(new_cache_entry)
 
     return lm_head_apply(x, output, final_norm), new_cache
@@ -614,8 +737,6 @@ def load_runtime(cfg: InferenceConfig):
         )
 
     pe = positionalEncoding_init(int(meta["max_seqlen"]), int(meta["d_model"]))
-    causal_mask = jnp.tril(jnp.ones((int(meta["max_seqlen"]), int(meta["max_seqlen"]))))
-    causal_mask = causal_mask[jnp.newaxis, :, :]
 
     runtime_info = {
         "tokenizer_json": tokenizer_json,
@@ -623,7 +744,7 @@ def load_runtime(cfg: InferenceConfig):
         "tokenizer_source": tokenizer_source,
         "checkpoint_source": checkpoint_source,
     }
-    return tokenizer, model, meta, pe, causal_mask, int(checkpoint.get("step", 0)), runtime_info
+    return tokenizer, model, meta, pe, int(checkpoint.get("step", 0)), runtime_info
 
 
 def sample_next_token(logits: np.ndarray, rng: np.random.Generator, tokenizer: HFWordPieceTokenizer, cfg: InferenceConfig) -> int:
@@ -649,7 +770,7 @@ def sample_next_token(logits: np.ndarray, rng: np.random.Generator, tokenizer: H
     return int(rng.choice(np.arange(logits.shape[-1]), p=probs))
 
 
-def generate_stream(prompt: str, tokenizer: HFWordPieceTokenizer, model, meta: dict[str, Any], pe, causal_mask, cfg: InferenceConfig):
+def generate_stream(prompt: str, tokenizer: HFWordPieceTokenizer, model, meta: dict[str, Any], pe, cfg: InferenceConfig):
     prompt = format_interactive_prompt(prompt, cfg)
     if cfg.use_kv_cache:
         yield from generate_stream_cached(prompt, tokenizer, model, meta, pe, cfg)
@@ -667,9 +788,9 @@ def generate_stream(prompt: str, tokenizer: HFWordPieceTokenizer, model, meta: d
             model,
             n_heads,
             pe,
-            causal_mask,
             int(meta.get("hyperconnection_sinkhorn_iters", 8)),
             bool(meta.get("scale_token_embeddings", True)),
+            attention_implementation=meta.get("attention_implementation", "cudnn"),
         )
         next_id = sample_next_token(np.asarray(logits[-1]), rng, tokenizer, cfg)
         if next_id == tokenizer.eos_id:
@@ -701,8 +822,8 @@ def generate_stream_cached(prompt: str, tokenizer: HFWordPieceTokenizer, model, 
             cache_len += 1
 
 
-def generate(prompt: str, tokenizer: HFWordPieceTokenizer, model, meta: dict[str, Any], pe, causal_mask, cfg: InferenceConfig) -> str:
-    return "".join(generate_stream(prompt, tokenizer, model, meta, pe, causal_mask, cfg))
+def generate(prompt: str, tokenizer: HFWordPieceTokenizer, model, meta: dict[str, Any], pe, cfg: InferenceConfig) -> str:
+    return "".join(generate_stream(prompt, tokenizer, model, meta, pe, cfg))
 
 
 def parse_args() -> argparse.Namespace:
@@ -717,7 +838,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def interactive_loop() -> None:
-    tokenizer, model, meta, pe, causal_mask, step, runtime_info = load_runtime(INFER)
+    tokenizer, model, meta, pe, step, runtime_info = load_runtime(INFER)
     print(f"config: {INFER.config_source}")
     print(f"loaded checkpoint: {runtime_info['checkpoint']} step={step} source={runtime_info['checkpoint_source']}")
     print(
@@ -747,17 +868,17 @@ def interactive_loop() -> None:
             print(f"meta={meta}")
             continue
         if prompt == "/reload":
-            tokenizer, model, meta, pe, causal_mask, step, runtime_info = load_runtime(INFER)
+            tokenizer, model, meta, pe, step, runtime_info = load_runtime(INFER)
             print(f"reloaded checkpoint: {runtime_info['checkpoint']} step={step}")
             continue
 
         print("输出> ", end="", flush=True)
         if INFER.stream:
-            for piece in generate_stream(prompt, tokenizer, model, meta, pe, causal_mask, INFER):
+            for piece in generate_stream(prompt, tokenizer, model, meta, pe, INFER):
                 print(piece, end="", flush=True)
             print()
         else:
-            print(generate(prompt, tokenizer, model, meta, pe, causal_mask, INFER), flush=True)
+            print(generate(prompt, tokenizer, model, meta, pe, INFER), flush=True)
 
 
 if __name__ == "__main__":
